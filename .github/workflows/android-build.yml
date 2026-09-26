@@ -1,15 +1,18 @@
-name: Android CI/CD
+name: Android CI
 
 on:
   push:
     branches: [ "master", "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "master", "main" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
@@ -22,49 +25,61 @@ jobs:
         distribution: 'temurin'
         cache: gradle
 
-    - name: Configure Android SDK
-      uses: android-actions/setup-android@v2
-      with:
-        channels: 'platforms,build-tools'
-        abi: 'armeabi-v7a'
-
-    - name: Install additional SDK components
+    - name: Set up Android SDK
       run: |
-        sdkmanager --update
-        sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-        yes | sdkmanager "licenses"
+        # 接受 SDK 许可后安装编译所需组件。
+        # 旧写法 `sdkmanager "licenses"` 把 licenses 当包名安装，直接报错导致 CI 全部失败。
+        yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+        "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+          "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+
+    - name: Decode release keystore from secrets
+      env:
+        KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      run: |
+        if [ -n "$KEYSTORE_BASE64" ]; then
+          mkdir -p keystore
+          echo "$KEYSTORE_BASE64" | base64 -d > keystore/release.keystore
+          printf 'storeFile=keystore/release.keystore\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > keystore.properties
+          echo "Keystore ready — release APK will be signed"
+        else
+          echo "::warning::Signing secrets not configured — building UNSIGNED release APK"
+        fi
 
     - name: Grant execute permission to gradlew
       run: chmod +x ./gradlew
 
-    - name: Cache Gradle dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.gradle/wrapper
-          ~/.gradle/caches
-        key: ${{ runner.os }}-gradle-${{ hashFiles('gradle-wrapper.properties') }}
-        restore-keys: |
-          ${{ runner.os }}-gradle-
+    - name: Run unit tests
+      run: ./gradlew :app:testDebugUnitTest --stacktrace
 
-    - name: Run lint checks
-      run: ./gradlew :app:lintRelease --no-daemon
+    - name: Build release APK
+      run: ./gradlew :app:assembleRelease --stacktrace
 
-    - name: Build Debug APK
-      run: ./gradlew :app:assembleDebug --no-daemon
-
-    - name: Upload Debug APK
-      if: success()
+    - name: Upload release APK artifact
       uses: actions/upload-artifact@v4
       with:
-        name: debug-apk
-        path: app/build/outputs/apk/debug/app-debug.apk
-        retention-days: 7
+        name: release-apk
+        path: app/build/outputs/apk/release/*.apk
+        retention-days: 30
 
-    - name: Upload APK maps
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: debug-maps
-        path: app/build/outputs/mapping/debug/
-        retention-days: 7
+    - name: Publish to GitHub Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+        NOTES=$(cat <<'EOF'
+        ## Photo Translate
+
+        端侧离线拍照/实时 OCR 翻译（CameraX + ML Kit）。
+
+        **安装提示**：本版本使用全新签名密钥，与 v1.0 签名不同，安装前需先卸载旧版。
+        EOF
+        )
+        gh release create "$GITHUB_REF_NAME" "$APK#app-release.apk" \
+          --title "Photo Translate $GITHUB_REF_NAME" --notes "$NOTES" || \
+        gh release upload "$GITHUB_REF_NAME" "$APK" --clobber

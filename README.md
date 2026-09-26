@@ -1,110 +1,47 @@
-# Photo Translate - Android App
+# Photo Translate
 
-A production-ready photo translation app using CameraX + ML Kit Text Recognition v2 + ML Kit Translate, built with Clean Architecture, Hilt, and Coroutines.
+Android 端侧（离线）**拍照/实时 OCR 翻译**应用。CameraX 取流 + ML Kit Text Recognition v2（拉丁 + 中日韩双识别器）+ ML Kit Translate 离线翻译，全程无需联网上传图片。
 
-## Project Structure
+## 功能
 
-```
-photoTranslate/
-├── app/                  # Android module
-├── .github/              # CI/CD configurations
-├── build.gradle          # Project-level build config
-├── gradle.properties     # Gradle project settings
-├── gradle-wrapper.properties # Gradle wrapper distribution
-├── gradlew               # Gradle wrapper script
-├── local.properties.template # SDK path template
-└── README.md             # This file
-```
+- 📷 **实时模式**：相机预览逐帧 OCR + 翻译，节流 250ms、仅处理最新帧，结果不跳动
+- 📸 **拍照模式**：拍照 → 方向校正 → 降采样 → OCR → 翻译 → 结果页展示
+- 🈶 **中日韩优先**：拉丁 + CJK 双识别器并行识别、按版面合并，支持竖排/多栏阅读顺序
+- 🌐 **语种自动检测**：OCR 文本块语种加权推断 + Language Identification 兜底，BCP-47 归一化（zh-Hans→zh）
+- 💾 **模型预热**：进入相机页后台预下载常用翻译模型，首次翻译不再卡顿
+- 📜 **历史记录**：Room 持久化；点击对焦、复制/分享结果
 
-## Getting Started
+## 技术栈
 
-### Prerequisites
+| 组件 | 版本 |
+|------|------|
+| AGP / Kotlin / Gradle | 8.3.2 / 1.9.22 / 8.5 |
+| 编译 SDK / minSdk / JDK | 34 / 21 / 17 |
+| CameraX | 1.3.4 |
+| ML Kit text-recognition (+chinese) | 16.0.0 |
+| ML Kit translate | 17.0.3（勿降级，见 HANDOVER.md 轮次 A） |
+| Room / Coroutines | 2.6.1 / 1.7.3 |
 
-- [Android Studio](https://developer.android.com/studio) (or command-line Android SDK)
-- [JDK 17](https://adoptium.net/)
-- Git
+依赖注入为手动构造器注入（无 Hilt）。
 
-### Setup
+## 构建
 
-1. **Clone the repository**
-```bash
-git clone <repository-url>
-cd photoTranslate
-```
+**推荐直接用 GitHub Actions**（push 到 master 自动构建，打 `v*` tag 自动发布 Release）：
 
-2. **Configure Android SDK path**
-```bash
-cp local.properties.template local.properties
-# Edit local.properties and set sdk.dir
-echo "sdk.dir=/path/to/your/android/sdk" > local.properties
-```
+- 签名密钥通过仓库 Secrets 注入：`RELEASE_KEYSTORE_BASE64` / `RELEASE_KEYSTORE_PASSWORD` / `RELEASE_KEY_ALIAS` / `RELEASE_KEY_PASSWORD`
+- 无 Secrets 时产出未签名 release APK
 
-3. **Open in Android Studio** and wait for Gradle sync to complete
+本地构建：复制 `local.properties.template` 为 `local.properties` 并填 `sdk.dir`，然后 `./gradlew :app:assembleRelease`（需准备签名文件）。
 
-## Building the APK
-
-### Option 1: Android Studio (Recommended)
-- Open the project in Android Studio
-- Select **Build > Build Bundle(s)/APK(s) > Build APK**
-- Find the APK at: `app/build/outputs/apk/debug/app-debug.apk`
-
-### Option 2: Command Line
-```bash
-# Build debug APK
-./gradlew :app:assembleDebug
-
-# Build release APK (with signing config)
-./gradlew :app:assembleRelease
-```
-
-### Option 3: GitHub Actions (Auto-build)
-Push code to GitHub, and the CI workflow will automatically:
-- Build the APK on every push to `master` or `main`
-- Run lint checks
-- Upload the APK as a Build Artifact
-
-## Features
-
-- 📸 **CameraX** with real-time preview and image capture
-- 📝 **ML Kit Text Recognition v2** for OCR
-- 🌍 **ML Kit Translate** for instant translation
-- 🔄 **Live mode** with text change detection (5-char threshold, 300ms throttle)
-- 📜 **History** with Room persistence
-- 🎨 **Material 3 DayNight** theme with dark mode support
-- 🔐 **Runtime permission handling** (camera, storage)
-- 📱 **Offline-aware** translation with model management
-- 🔌 **Pluggable translation engine** interface
-
-## Architecture
+## 目录
 
 ```
-Presentation Layer (UI)
-    ↓
-ViewModel → Use Cases (Business Logic)
-    ↓
-Repositories → Data Sources (ML Kit, Room, Remote)
-    ↓
-Domain Layer (Models, Interfaces)
-    ↓
-Data Layer (Room DAOs, ML Kit Wrappers)
+app/src/main/kotlin/com/example/phototranslate/
+├── application/   # 全局单例：双 OCR 识别器
+├── domain/        # 数据模型 + LangUtil(BCP-47归一化) + ReadingOrder(版面阅读顺序)
+├── repository/    # OCR 双识别器合并 / 翻译缓存与预热 / 历史
+├── usecase/       # 用例层
+└── ui/            # camera(主页) / result / history / language / settings
 ```
 
-Dependency Injection: [Hilt](https://dagger.dev/hilt/)
-
-## Dependencies
-
-| Component | Version |
-|-----------|---------|
-| AGP | 8.2.2 |
-| Kotlin | 1.9.0 |
-| Hilt | 2.52 |
-| CameraX | 1.4.0-alpha06 |
-| ML Kit OCR | 16.0.0 |
-| ML Kit Translate | 16.0.0 |
-| Room | 2.6.1 |
-| Navigation | 2.7.7 |
-| Coil | 2.5.0 |
-
-## License
-
-MIT License - See LICENSE file for details.
+更多历史修复背景与硬约束见根目录 `HANDOVER.md`。

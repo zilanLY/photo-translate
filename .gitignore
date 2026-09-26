@@ -5,10 +5,10 @@
 build/
 *.log
 
-# Gradle
-gradle.properties
-gradle-wrapper.properties
-*.properties
+# Gradle —— 只忽略本地路径/密钥类 properties；
+# gradle.properties 与 gradle-wrapper.properties 必须入库（否则 CI 上 gradlew 无法运行）。
+local.properties
+keystore.properties
 
 # Release signing keystore (contains secrets, never commit)
 keystore/
@@ -20,7 +20,6 @@ app/outputs/
 app/generated/
 *.aab
 *.apk
-*.apk
 
 # Kotlin/Kotlin Gradle plugin
 *.kotlin_module
@@ -28,25 +27,6 @@ app/generated/
 # Mock data
 src/test/mockdata/
 
-# LeakCanary
-leakcanary/
-
-# Local properties
-local.properties
-
-# Coverage reports
-build/reports/
-build/intermediates/
-
-# Firebase local emulator
-firebase/local-emulator/
-
 # Android Studio
 *.DS_Store
 .swaps
-
-# Coverage
-build/coverage/
-
-# Log files
-*.log

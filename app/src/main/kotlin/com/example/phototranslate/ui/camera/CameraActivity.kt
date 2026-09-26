@@ -69,6 +69,9 @@ class CameraActivity : AppCompatActivity() {
     }
 
     private enum class Mode { LIVE, PHOTO }
+
+    // 相机分析线程与主线程都会访问，需保证可见性。
+    @Volatile
     private var currentMode = Mode.LIVE
 
     private var lastOcrTime = 0L
@@ -77,6 +80,11 @@ class CameraActivity : AppCompatActivity() {
 
     // OCR 并发守卫：实时模式下仅允许同时存在一次识别+翻译，避免帧在相机线程堆积导致卡顿。
     private val ocrRunning = AtomicBoolean(false)
+
+    // 翻译代数令牌：帧间 OCR 抖动会连续触发多次翻译，旧结果可能晚于新结果返回，
+    // 直接显示会导致译文来回跳变。仅代数最新的结果允许上屏（latest-wins）。
+    private val translationGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+    private val translatingText = AtomicReference("")
 
     private lateinit var requestPermissionLauncher: ActivityResultLauncher<String>
 
@@ -231,7 +239,9 @@ class CameraActivity : AppCompatActivity() {
 
                 val imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(1280, 720))
+                    // 实时识别分辨率 960×540：OCR/翻译不需要高清帧，更低分辨率显著缩短
+                    // 双识别器耗时，提升实时跟手度（拍照走独立的高分辨率 ImageCapture）。
+                    .setTargetResolution(Size(960, 540))
                     .build()
                     .also { it.setAnalyzer(cameraExecutor) { imageProxy -> processFrame(imageProxy) } }
 
@@ -256,6 +266,11 @@ class CameraActivity : AppCompatActivity() {
 
     // ===== 实时识别 =====
     private fun processFrame(imageProxy: ImageProxy) {
+        // 拍照模式下实时识别完全停跑：既省电，也避免与拍照 OCR 抢 CPU 拖慢出片速度。
+        if (currentMode == Mode.PHOTO) {
+            imageProxy.close()
+            return
+        }
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastOcrTime < ocrThrottleInterval) {
             imageProxy.close()
@@ -268,29 +283,33 @@ class CameraActivity : AppCompatActivity() {
         }
         lastOcrTime = currentTime
 
-        cameraExecutor.execute {
-            try {
-                // analyze 在 finally 中关闭 imageProxy（仓库独占其生命周期），调用方不再关闭
-                val ocrResult = ocrUseCase.analyze(imageProxy)
-                mainHandler.post {
-                    try {
-                        handleOcrResult(ocrResult)
-                    } catch (t: Throwable) {
-                        Log.e("CameraActivity", "handleOcrResult failed", t)
-                    }
+        try {
+            // 分析器回调本就运行在 cameraExecutor 上，直接同步执行即可；
+            // 旧实现再排一层 cameraExecutor.execute 会额外占用线程并延迟 proxy 关闭。
+            // analyze 在 finally 中关闭 imageProxy（仓库独占其生命周期），调用方不再关闭
+            val ocrResult = ocrUseCase.analyze(imageProxy)
+            mainHandler.post {
+                try {
+                    handleOcrResult(ocrResult)
+                } catch (t: Throwable) {
+                    Log.e("CameraActivity", "handleOcrResult failed", t)
                 }
-            } catch (t: Throwable) {
-                Log.e("CameraActivity", "OCR frame failed", t)
-                try { imageProxy.close() } catch (_: Throwable) { /* no-op */ }
-            } finally {
-                ocrRunning.set(false)
             }
+        } catch (t: Throwable) {
+            Log.e("CameraActivity", "OCR frame failed", t)
+            try { imageProxy.close() } catch (_: Throwable) { /* no-op */ }
+        } finally {
+            ocrRunning.set(false)
         }
     }
 
     private fun handleOcrResult(ocrResult: OcrResult) {
         if (ocrResult.success && ocrResult.textRecognitionResult != null) {
             val fullText = ocrResult.textRecognitionResult.fullText
+            if (fullText.isBlank()) {
+                showNoText()
+                return
+            }
             binding.originalText.text = if (fullText.length > 100) {
                 fullText.substring(0, 100) + "…"
             } else fullText
@@ -300,31 +319,45 @@ class CameraActivity : AppCompatActivity() {
                 translateLive(fullText, source)
             }
         } else {
-            binding.originalText.text = ""
-            binding.translatedText.text = getString(R.string.status_no_text)
-            updateStatus(getString(R.string.status_no_text))
+            showNoText()
         }
+    }
+
+    private fun showNoText() {
+        binding.originalText.text = ""
+        binding.translatedText.text = getString(R.string.status_no_text)
+        updateStatus(getString(R.string.status_no_text))
     }
 
     /**
      * 解析翻译源语言：用户在语言页显式选择时尊重其选择；选「自动」时采用 OCR 推断的主导语种
      * （由 DefaultOcrRepository 按文本块 recognizedLanguage 加权得出），比 LanguageIdentification 更准。
+     * 归一化到主语言码（zh-Hans→zh），供翻译仓库与 UI/历史记录统一使用。
      */
     private fun resolveSource(userSource: String, ocrResult: OcrResult): String {
         if (userSource != "auto") return userSource
-        return ocrResult.textRecognitionResult?.dominantLanguage ?: "auto"
+        val dominant = ocrResult.textRecognitionResult?.dominantLanguage
+        return com.example.phototranslate.domain.LangUtil.normalize(dominant) ?: "auto"
     }
 
     private fun translateLive(text: String, sourceLang: String) {
         val previous = previousText.get()
         if (text == previous) return
+        // 已有相同内容的翻译在进行中，不重复发起（OCR 抖动会反复触发相同文本）。
+        if (text == translatingText.get()) return
         previousText.set(text)
+        translatingText.set(text)
         updateStatus(getString(R.string.status_translating))
+        val generation = translationGeneration.incrementAndGet()
 
         lifecycleScope.launch(Dispatchers.IO + coroutineExceptionHandler) {
             val target = LanguagePreferences.getTarget(this@CameraActivity)
-            val result = translateUseCase.translate(text, sourceLang, target)
+            // 实时模式限制翻译输入长度：超长文本显著拖慢端侧翻译，实时跟手优先。
+            val trimmed = if (text.length > 600) text.substring(0, 600) else text
+            val result = translateUseCase.translate(trimmed, sourceLang, target)
             mainHandler.post {
+                // 只呈现最新一帧的翻译结果，避免旧结果晚到覆盖新结果导致译文跳动。
+                if (generation != translationGeneration.get()) return@post
                 if (result.errorMessage != null) {
                     binding.translatedText.text = result.errorMessage
                 } else {

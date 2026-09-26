@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.StatFs
 import android.util.Log
 import com.example.phototranslate.domain.ALL_LANGUAGE_OPTIONS
+import com.example.phototranslate.domain.LangUtil
 import com.example.phototranslate.domain.LanguageOption
 import com.example.phototranslate.domain.ModelDownloadStatus
 import com.example.phototranslate.domain.ModelDownloadEvent
@@ -68,20 +69,25 @@ class DefaultTranslateRepository(
     }
 
     /**
-     * Resolve the source language. For "auto" we detect the language of the text
-     * using ML Kit Language Identification; otherwise we use the provided code.
+     * Resolve the source language to a Translate-supported code, or null when it cannot be
+     * determined. "auto" 用 LanguageIdentification 探测；显式码经 BCP-47 归一化。
+     * 不支持的语种返回 null，由调用方报错——绝不静默回退成英文（旧实现的乱码根因）。
      */
-    private fun resolveSourceLanguage(sourceLanguage: String, text: String): String {
+    private fun resolveSourceLanguage(sourceLanguage: String, text: String): String? {
         val code = if (sourceLanguage == "auto") {
-            detectLanguageCode(text)
+            LangUtil.normalize(detectLanguageCode(text))
         } else {
-            sourceLanguage
+            LangUtil.normalize(sourceLanguage)
         }
-        return safeTranslateLanguage(code)
+        return code?.takeIf { TranslateLanguage.getAllLanguages().contains(it) }
     }
 
-    private fun safeTranslateLanguage(code: String): String {
-        return if (TranslateLanguage.getAllLanguages().contains(code)) code else TranslateLanguage.ENGLISH
+    /**
+     * 目标语言归一化 + 支持性校验。不支持返回 null（调用方报错）。
+     */
+    private fun resolveTargetLanguage(targetLanguage: String): String? {
+        return LangUtil.normalize(targetLanguage)
+            ?.takeIf { TranslateLanguage.getAllLanguages().contains(it) }
     }
 
     /**
@@ -97,14 +103,10 @@ class DefaultTranslateRepository(
 
     override fun translate(text: String, sourceLanguage: String, targetLanguage: String): Result<String> {
         return try {
-            // Ensure model is available for target language (Translate auto-downloads on first use)
-            if (!isModelAvailable(targetLanguage)) {
-                // Model will download automatically on first translate call
-                // In a UI, we could show a "Downloading..." message
-            }
-
             val sourceLang = resolveSourceLanguage(sourceLanguage, text)
-            val targetLang = safeTranslateLanguage(targetLanguage)
+                ?: return Result.failure(IllegalArgumentException("无法识别源语言，请检查照片文字是否清晰"))
+            val targetLang = resolveTargetLanguage(targetLanguage)
+                ?: return Result.failure(IllegalArgumentException("不支持的目标语言: $targetLanguage"))
 
             // 源语言与目标语言相同（如中文→中文）时，ML Kit 会抛 IllegalArgumentException，
             // 此时无需翻译，直接返回原文。
@@ -153,13 +155,6 @@ class DefaultTranslateRepository(
             // If we can't check disk space, assume it's fine
             true
         }
-    }
-
-    /**
-     * Check if model can be used (availability check).
-     */
-    private fun isModelAvailable(languageCode: String): Boolean {
-        return isModelInstalled(languageCode) && checkDiskSpace()
     }
 
     override fun downloadModel(languageCode: String): Flow<ModelManagerResult> = flow {
@@ -297,8 +292,8 @@ class DefaultTranslateRepository(
      * 这里在后台主动触发，使实时/拍照的首次翻译不再阻塞等待下载（否则首帧会卡数秒）。
      */
     override fun preload(sourceLanguage: String, targetLanguage: String) {
-        val src = safeTranslateLanguage(sourceLanguage)
-        val tgt = safeTranslateLanguage(targetLanguage)
+        val src = resolveSourceLanguage(sourceLanguage, "") ?: return
+        val tgt = resolveTargetLanguage(targetLanguage) ?: return
         if (src == tgt) return
         translateLock.lock()
         try {
